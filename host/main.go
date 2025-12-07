@@ -16,7 +16,7 @@ import (
 )
 
 const (
-	backendWasm = "build/backend.wasm"
+	backendWasm = "backend/build/backend.wasm"
 	appWasm     = "web/app.wasm"
 	wasmExec    = "web/wasm_exec.js"
 	indexHTML   = "web/index.html"
