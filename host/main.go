@@ -1,24 +1,35 @@
 package main
 
 import (
+	"bufio"
+	"bytes"
 	"context"
-	_ "embed"
-	"flag"
-	"fmt"
-	"log"
-	"strconv"
+	"encoding/json"
+	"net/http"
+	"os"
+	"strings"
 
+	backenddb "example.com/go-wasm-fullstack/backend/db"
 	"github.com/tetratelabs/wazero"
 	"github.com/tetratelabs/wazero/imports/wasi_snapshot_preview1"
+	"gorm.io/gorm"
 )
 
-// add.wasm をバイナリとして埋め込む例
-//
-//go:embed add.wasm
-var addWasm []byte
+const (
+	backendWasm = "build/backend.wasm"
+	appWasm     = "web/app.wasm"
+	wasmExec    = "web/wasm_exec.js"
+	indexHTML   = "web/index.html"
+)
+
+type server struct {
+	runtime wazero.Runtime
+	module  wazero.CompiledModule
+	db      *gorm.DB
+}
 
 func main() {
-	flag.Parse()
+	loadEnv(".env")
 
 	ctx := context.Background()
 	runtime := wazero.NewRuntime(ctx)
@@ -26,40 +37,78 @@ func main() {
 
 	wasi_snapshot_preview1.MustInstantiate(ctx, runtime)
 
-	module, err := runtime.InstantiateWithConfig(ctx, addWasm, wazero.NewModuleConfig().WithStartFunctions("_initialize"))
+	raw, err := os.ReadFile(backendWasm)
 	if err != nil {
-		log.Fatalf("failed to instantiate module: %v", err)
+		panic(err)
+	}
+	module, err := runtime.CompileModule(ctx, raw)
+	if err != nil {
+		panic(err)
 	}
 	defer module.Close(ctx)
 
-	a, b := operands()
-
-	add := module.ExportedFunction("Add")
-	if add == nil {
-		log.Fatal("Add export not found")
-	}
-
-	results, err := add.Call(ctx, uint64(uint32(a)), uint64(uint32(b)))
+	db, closeDB, err := backenddb.Open()
 	if err != nil {
-		log.Fatalf("failed to call Add: %v", err)
+		panic(err)
 	}
+	defer closeDB()
 
-	fmt.Printf("%d + %d = %d\n", a, b, int32(uint32(results[0])))
+	srv := &server{runtime: runtime, module: module, db: db}
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/records", srv.recordsHandler)
+	mux.HandleFunc("/app.wasm", func(w http.ResponseWriter, r *http.Request) {
+		http.ServeFile(w, r, appWasm)
+	})
+	mux.HandleFunc("/wasm_exec.js", func(w http.ResponseWriter, r *http.Request) {
+		http.ServeFile(w, r, wasmExec)
+	})
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		http.ServeFile(w, r, indexHTML)
+	})
+
+	http.ListenAndServe(":8080", mux)
 }
 
-func operands() (int32, int32) {
-	if flag.NArg() < 2 {
-		return 1, 41
+func (s *server) recordsHandler(w http.ResponseWriter, r *http.Request) {
+	records, err := backenddb.LoadRecords(r.Context(), s.db)
+	if err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		return
 	}
-	return parseOrDefault(flag.Arg(0), 1), parseOrDefault(flag.Arg(1), 41)
+
+	payload, _ := json.Marshal(records)
+	var stdout bytes.Buffer
+	cfg := wazero.NewModuleConfig().WithStdout(&stdout).WithStdin(bytes.NewReader(payload))
+
+	mod, err := s.runtime.InstantiateModule(r.Context(), s.module, cfg)
+	if err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+	defer mod.Close(r.Context())
+
+	out := bytes.TrimSpace(stdout.Bytes())
+	w.Header().Set("Content-Type", "application/json")
+	w.Write(out)
 }
 
-func parseOrDefault(v string, fallback int32) int32 {
-	if v == "" {
-		return fallback
+func loadEnv(path string) {
+	f, err := os.Open(path)
+	if err != nil {
+		return
 	}
-	if n, err := strconv.ParseInt(v, 10, 32); err == nil {
-		return int32(n)
+	defer f.Close()
+	scanner := bufio.NewScanner(f)
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		parts := strings.SplitN(line, "=", 2)
+		if len(parts) != 2 {
+			continue
+		}
+		os.Setenv(strings.TrimSpace(parts[0]), strings.Trim(strings.TrimSpace(parts[1]), "\""))
 	}
-	return fallback
 }
